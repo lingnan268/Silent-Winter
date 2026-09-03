@@ -1,0 +1,56 @@
+#pragma once
+
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <cstdlib>
+
+struct Config {
+    std::string input_video;
+    std::string output_video;
+    std::string output_csv;
+
+    int queue_capacity = 8;
+
+    int h_min = 90,  h_max = 140;
+    int s_min = 80,  s_max = 255;
+    int v_min = 50,  v_max = 255;
+
+    int min_area = 100;
+    int max_area = 10000;
+    int max_missed_frames = 5;
+    int max_match_distance = 80;
+
+    static Config from_file(const std::string &path) {
+        Config cfg;
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            std::cerr << "无法打开配置文件: " << path << std::endl;
+            std::exit(1);
+        }
+        std::string line;
+        while (std::getline(file, line)) {
+            auto pos = line.find('=');
+            if (pos == std::string::npos) continue;
+            std::string key = line.substr(0, pos);
+            std::string val = line.substr(pos + 1);
+            if (key == "input_video")         cfg.input_video = val;
+            else if (key == "output_video")   cfg.output_video = val;
+            else if (key == "output_csv")     cfg.output_csv = val;
+            else if (key == "queue_capacity") cfg.queue_capacity = std::stoi(val);
+            else if (key == "h_min")  cfg.h_min  = std::stoi(val);
+            else if (key == "h_max")  cfg.h_max  = std::stoi(val);
+            else if (key == "s_min")  cfg.s_min  = std::stoi(val);
+            else if (key == "s_max")  cfg.s_max  = std::stoi(val);
+            else if (key == "v_min")  cfg.v_min  = std::stoi(val);
+            else if (key == "v_max")  cfg.v_max  = std::stoi(val);
+            else if (key == "min_area")           cfg.min_area = std::stoi(val);
+            else if (key == "max_area")           cfg.max_area = std::stoi(val);
+            else if (key == "max_missed_frames")  cfg.max_missed_frames = std::stoi(val);
+            else if (key == "max_match_distance") cfg.max_match_distance = std::stoi(val);
+        }
+        file.close();
+        return cfg;
+    }
+};
