@@ -1,0 +1,142 @@
+#pragma once
+
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <cmath>
+#include "data_types.h"
+#include "thread_safe_queue.h"
+#include "config_parser.h"
+
+class TargetTracker {
+public:
+    TargetTracker(const Config &cfg,
+                  ThreadSafeQueue<TargetObservation> &in,
+                  ThreadSafeQueue<TrackingResult> &out)
+        : cfg_(cfg), in_(in), out_(out),
+          kf_(4, 2, 0, CV_32F),
+          initialized_(false), missed_count_(0) {
+
+        // 状态: [x, y, vx, vy]，观测: [x, y]
+        // 状态转移矩阵 F（先设单位阵，每帧按 dt 更新）
+        cv::setIdentity(kf_.transitionMatrix);
+        // 测量矩阵 H = [[1,0,0,0],[0,1,0,0]]
+        kf_.measurementMatrix = cv::Mat::zeros(2, 4, CV_32F);
+        kf_.measurementMatrix.at<float>(0, 0) = 1.f;
+        kf_.measurementMatrix.at<float>(1, 1) = 1.f;
+        // 过程噪声协方差 Q
+        cv::setIdentity(kf_.processNoiseCov, cv::Scalar(1e-2));
+        // 测量噪声协方差 R
+        cv::setIdentity(kf_.measurementNoiseCov, cv::Scalar(1e-1));
+        // 误差协方差 P
+        cv::setIdentity(kf_.errorCovPost, cv::Scalar(1));
+        // 初始状态
+        kf_.statePost = cv::Mat::zeros(4, 1, CV_32F);
+    }
+
+    void run() {
+        TargetObservation obs;
+        while (in_.wait_and_pop(obs)) {
+            TrackingResult res;
+            res.sequence = obs.sequence;
+            res.timestamp_us = obs.timestamp_us;
+
+            if (obs.detected) {
+                cv::Mat measurement = (cv::Mat_<float>(2, 1) <<
+                    obs.center.x, obs.center.y);
+
+                if (!initialized_) {
+                    // 首次检测，初始化卡尔曼滤波器
+                    kf_.statePost.at<float>(0) = obs.center.x;
+                    kf_.statePost.at<float>(1) = obs.center.y;
+                    kf_.statePost.at<float>(2) = 0.f;
+                    kf_.statePost.at<float>(3) = 0.f;
+                    cv::setIdentity(kf_.errorCovPost, cv::Scalar(1));
+                    initialized_ = true;
+                    missed_count_ = 0;
+
+                    res.valid = true;
+                    res.predicted = false;
+                    res.measured_position = obs.center;
+                    res.filtered_position = obs.center;
+                    res.velocity = {0.f, 0.f};
+                } else {
+                    // 距离门限检查
+                    float dx = obs.center.x - kf_.statePost.at<float>(0);
+                    float dy = obs.center.y - kf_.statePost.at<float>(1);
+                    float dist = std::sqrt(dx * dx + dy * dy);
+
+                    if (dist > static_cast<float>(cfg_.max_match_distance)) {
+                        // 检测偏离预测太远，视为异常，走预测路径
+                        predict_step();
+                        res.valid = (missed_count_ <= cfg_.max_missed_frames);
+                        res.predicted = true;
+                        res.measured_position = {0.f, 0.f};
+                        res.filtered_position = {kf_.statePost.at<float>(0),
+                                                 kf_.statePost.at<float>(1)};
+                        res.velocity = {kf_.statePost.at<float>(2),
+                                        kf_.statePost.at<float>(3)};
+                    } else {
+                        // 正常更新
+                        predict_step();
+                        cv::Mat estimated = kf_.correct(measurement);
+                        missed_count_ = 0;
+
+                        res.valid = true;
+                        res.predicted = false;
+                        res.measured_position = obs.center;
+                        res.filtered_position = {estimated.at<float>(0),
+                                                 estimated.at<float>(1)};
+                        res.velocity = {estimated.at<float>(2),
+                                        estimated.at<float>(3)};
+                    }
+                }
+            } else {
+                // 未检测到，纯预测
+                if (initialized_) {
+                    predict_step();
+                    missed_count_++;
+                    res.valid = (missed_count_ <= cfg_.max_missed_frames);
+                    res.predicted = true;
+                    res.measured_position = {0.f, 0.f};
+                    res.filtered_position = {kf_.statePost.at<float>(0),
+                                             kf_.statePost.at<float>(1)};
+                    res.velocity = {kf_.statePost.at<float>(2),
+                                    kf_.statePost.at<float>(3)};
+
+                    if (missed_count_ > cfg_.max_missed_frames) {
+                        res.valid = false;
+                    }
+                } else {
+                    // 尚未初始化，无有效跟踪
+                    res.valid = false;
+                    res.predicted = false;
+                    res.measured_position = {0.f, 0.f};
+                    res.filtered_position = {0.f, 0.f};
+                    res.velocity = {0.f, 0.f};
+                }
+            }
+
+            if (!out_.push(std::move(res))) break;
+        }
+
+        std::cout << "[TargetTracker] 跟踪完毕" << std::endl;
+        out_.close();
+    }
+
+private:
+    void predict_step() {
+        // 使用当前速度更新状态转移矩阵的 dt 部分
+        // 默认 dt=1（帧间），简化处理
+        kf_.transitionMatrix.at<float>(0, 2) = 1.f;
+        kf_.transitionMatrix.at<float>(1, 3) = 1.f;
+        kf_.predict();
+    }
+
+    const Config &cfg_;
+    ThreadSafeQueue<TargetObservation> &in_;
+    ThreadSafeQueue<TrackingResult> &out_;
+
+    cv::KalmanFilter kf_;
+    bool initialized_;
+    int missed_count_;
+};
