@@ -1,0 +1,2 @@
+// ResultWriter is header-only, no .cpp needed.
+// This file exists to satisfy CMake target; it is intentionally empty.
