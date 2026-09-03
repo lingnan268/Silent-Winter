@@ -1,0 +1,83 @@
+#pragma once
+
+#include <opencv2/opencv.hpp>
+#include <vector>
+#include <iostream>
+#include "data_types.h"
+#include "thread_safe_queue.h"
+#include "config_parser.h"
+
+class ColorDetector {
+public:
+    ColorDetector(const Config &cfg,
+                  ThreadSafeQueue<ImageFrame> &in,
+                  ThreadSafeQueue<TargetObservation> &out)
+        : cfg_(cfg), in_(in), out_(out) {}
+
+    void run() {
+        cv::Scalar lower(cfg_.h_min, cfg_.s_min, cfg_.v_min);
+        cv::Scalar upper(cfg_.h_max, cfg_.s_max, cfg_.v_max);
+
+        ImageFrame frame;
+        while (in_.wait_and_pop(frame)) {
+            TargetObservation obs;
+            obs.sequence = frame.sequence;
+            obs.timestamp_us = frame.timestamp_us;
+            obs.detected = false;
+
+            if (!frame.image.empty()) {
+                cv::Mat hsv, mask;
+                cv::cvtColor(frame.image, hsv, cv::COLOR_BGR2HSV);
+                cv::inRange(hsv, lower, upper, mask);
+
+                // 形态学操作去噪
+                cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5));
+                cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+                cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+                // 轮廓检测
+                std::vector<std::vector<cv::Point>> contours;
+                cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+                float best_score = 0.f;
+                cv::Point2f best_center{0.f, 0.f};
+                float best_radius = 0.f;
+
+                for (const auto &c : contours) {
+                    double area = cv::contourArea(c);
+                    if (area < cfg_.min_area || area > cfg_.max_area) continue;
+
+                    cv::Point2f center;
+                    float radius;
+                    cv::minEnclosingCircle(c, center, radius);
+
+                    float circle_area = static_cast<float>(CV_PI * radius * radius);
+                    float score = static_cast<float>(area) / circle_area;
+
+                    if (score > best_score) {
+                        best_score = score;
+                        best_center = center;
+                        best_radius = radius;
+                    }
+                }
+
+                if (best_score > 0.f) {
+                    obs.detected = true;
+                    obs.center = best_center;
+                    obs.radius = best_radius;
+                    obs.confidence = best_score;
+                }
+            }
+
+            if (!out_.push(std::move(obs))) break;
+        }
+
+        std::cout << "[ColorDetector] 检测完毕" << std::endl;
+        out_.close();
+    }
+
+private:
+    const Config &cfg_;
+    ThreadSafeQueue<ImageFrame> &in_;
+    ThreadSafeQueue<TargetObservation> &out_;
+};
