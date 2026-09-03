@@ -1,0 +1,131 @@
+#pragma once
+
+#include <opencv2/opencv.hpp>
+#include <fstream>
+#include <iostream>
+#include <sys/stat.h>
+#include "data_types.h"
+#include "thread_safe_queue.h"
+#include "config_parser.h"
+
+class ResultWriter {
+public:
+    ResultWriter(const Config &cfg,
+                 ThreadSafeQueue<TrackingResult> &in,
+                 ThreadSafeQueue<ImageFrame> &frame_in)
+        : cfg_(cfg), in_(in), frame_in_(frame_in) {}
+
+    void run() {
+        // 确保输出目录存在
+        ensure_output_dir(cfg_.output_csv);
+        ensure_output_dir(cfg_.output_video);
+
+        // 打开 CSV
+        std::ofstream csv(cfg_.output_csv);
+        if (!csv.is_open()) {
+            std::cerr << "[ResultWriter] 无法打开 CSV: " << cfg_.output_csv << std::endl;
+            drain_input();
+            frame_in_.close();
+            return;
+        }
+        csv << "frame_id,timestamp_us,detected,predicted,measure_x,measure_y,track_x,track_y,vx,vy\n";
+
+        // 打开视频 writer（延迟设置，需要第一帧的尺寸）
+        cv::VideoWriter writer;
+        bool writer_opened = false;
+
+        // 先读入所有帧缓存（用于可视化叠加）
+        // 注意：为了不无限占用内存，我们并行处理——读一帧写一帧
+        // 但因为两个队列的速度可能不同，用简单的方式：先缓存帧
+        std::vector<ImageFrame> frames;
+        ImageFrame f;
+        while (frame_in_.wait_and_pop(f)) {
+            frames.push_back(std::move(f));
+        }
+
+        std::cout << "[ResultWriter] 缓存帧数: " << frames.size() << std::endl;
+
+        // 按 sequence 建索引
+        // 处理跟踪结果
+        TrackingResult res;
+        std::uint64_t result_idx = 0;
+
+        while (in_.wait_and_pop(res)) {
+            // 写 CSV
+            csv << res.sequence << ","
+                << res.timestamp_us << ","
+                << (res.valid && !res.predicted ? 1 : 0) << ","
+                << (res.predicted ? 1 : 0) << ","
+                << res.measured_position.x << ","
+                << res.measured_position.y << ","
+                << res.filtered_position.x << ","
+                << res.filtered_position.y << ","
+                << res.velocity.x << ","
+                << res.velocity.y << "\n";
+
+            // 可视化
+            if (res.sequence < frames.size()) {
+                cv::Mat vis;
+                if (!frames[res.sequence].image.empty()) {
+                    vis = frames[res.sequence].image.clone();
+                } else {
+                    continue;
+                }
+
+                // 检测位置：圆圈（绿色）
+                if (res.valid && !res.predicted) {
+                    cv::circle(vis, res.measured_position, 5, cv::Scalar(0, 255, 0), 2);
+                }
+
+                // 滤波位置：十字（蓝色）
+                if (res.valid) {
+                    cv::Point2f p = res.filtered_position;
+                    cv::Scalar color = res.predicted ? cv::Scalar(0, 0, 255) : cv::Scalar(255, 0, 0);
+                    cv::line(vis, cv::Point(p.x - 8, p.y), cv::Point(p.x + 8, p.y), color, 2);
+                    cv::line(vis, cv::Point(p.x, p.y - 8), cv::Point(p.x, p.y + 8), color, 2);
+                }
+
+                // 打开 writer
+                if (!writer_opened) {
+                    double fps = 30.0;
+                    cv::Size frame_size(vis.cols, vis.rows);
+                    writer.open(cfg_.output_video, cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                                fps, frame_size);
+                    if (!writer.isOpened()) {
+                        std::cerr << "[ResultWriter] 无法打开视频: " << cfg_.output_video << std::endl;
+                    }
+                    writer_opened = true;
+                }
+
+                if (writer.isOpened()) {
+                    writer.write(vis);
+                }
+            }
+        }
+
+        csv.close();
+        if (writer.isOpened()) writer.release();
+        std::cout << "[ResultWriter] 结果已保存" << std::endl;
+    }
+
+private:
+    void drain_input() {
+        TrackingResult r;
+        while (in_.wait_and_pop(r)) {}
+    }
+
+    void ensure_output_dir(const std::string &path) {
+        auto pos = path.find_last_of('/');
+        if (pos == std::string::npos) pos = path.find_last_of('\\');
+        if (pos != std::string::npos) {
+            std::string dir = path.substr(0, pos);
+            // 递归创建目录
+            std::string cmd = "mkdir -p " + dir;
+            system(cmd.c_str());
+        }
+    }
+
+    const Config &cfg_;
+    ThreadSafeQueue<TrackingResult> &in_;
+    ThreadSafeQueue<ImageFrame> &frame_in_;
+};
