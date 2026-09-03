@@ -1,0 +1,171 @@
+#include <iostream>
+#include <thread>
+#include <string>
+#include <vector>
+
+#include "config_parser.h"
+#include "data_types.h"
+#include "thread_safe_queue.h"
+#include "frame_source.h"
+#include "color_detector.h"
+#include "target_tracker.h"
+#include "result_writer.h"
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) {
+        std::cerr << "用法: " << argv[0] << " <配置文件路径>" << std::endl;
+        std::cerr << "示例: " << argv[0] << " config/vision.conf" << std::endl;
+        return 1;
+    }
+
+    Config cfg = Config::from_file(argv[1]);
+
+    std::cout << "=== rm_vision_sim ===" << std::endl;
+    std::cout << "输入视频: " << cfg.input_video << std::endl;
+    std::cout << "输出视频: " << cfg.output_video << std::endl;
+    std::cout << "输出 CSV: " << cfg.output_csv << std::endl;
+    std::cout << "队列容量: " << cfg.queue_capacity << std::endl;
+    std::cout << "HSV 范围: [" << cfg.h_min << "," << cfg.h_max << "] ["
+              << cfg.s_min << "," << cfg.s_max << "] ["
+              << cfg.v_min << "," << cfg.v_max << "]" << std::endl;
+    std::cout << "面积范围: [" << cfg.min_area << "," << cfg.max_area << "]" << std::endl;
+    std::cout << "最大丢失帧数: " << cfg.max_missed_frames << std::endl;
+    std::cout << "最大匹配距离: " << cfg.max_match_distance << std::endl;
+    std::cout << std::endl;
+
+    // 三个队列：frame_queue, obs_queue, result_queue
+    ThreadSafeQueue<ImageFrame> frame_queue(cfg.queue_capacity);
+    ThreadSafeQueue<TargetObservation> obs_queue(cfg.queue_capacity);
+    ThreadSafeQueue<TrackingResult> result_queue(cfg.queue_capacity);
+
+    // 模块1：FrameSource（读视频）
+    FrameSource frame_source(cfg, frame_queue);
+
+    // 模块2：ColorDetector（HSV检测）
+    ColorDetector color_detector(cfg, frame_queue, obs_queue);
+
+    // 模块3：TargetTracker（卡尔曼滤波跟踪）
+    TargetTracker target_tracker(cfg, obs_queue, result_queue);
+
+    // 模块4：ResultWriter（用 VideoCapture 重新读视频做可视化，避免死锁）
+    std::thread t_writer([&]() {
+        // 确保输出目录存在
+        auto ensure_dir = [](const std::string &path) {
+            auto pos = path.find_last_of('/');
+            if (pos != std::string::npos) {
+                std::string dir = path.substr(0, pos);
+                std::string cmd = "mkdir -p " + dir;
+                system(cmd.c_str());
+            }
+        };
+        ensure_dir(cfg.output_csv);
+        ensure_dir(cfg.output_video);
+
+        std::ofstream csv(cfg.output_csv);
+        if (!csv.is_open()) {
+            std::cerr << "[ResultWriter] 无法打开 CSV: " << cfg.output_csv << std::endl;
+            TrackingResult r;
+            while (result_queue.wait_and_pop(r)) {}
+            return;
+        }
+        csv << "frame_id,timestamp_us,detected,predicted,measure_x,measure_y,track_x,track_y,vx,vy\n";
+
+        // 用 VideoCapture 重新读视频做可视化
+        cv::VideoCapture vis_cap(cfg.input_video, cv::CAP_FFMPEG);
+        if (!vis_cap.isOpened()) {
+            std::cerr << "[ResultWriter] 无法打开视频用于可视化" << std::endl;
+            // 只写 CSV，不生成视频
+            TrackingResult res;
+            while (result_queue.wait_and_pop(res)) {
+                csv << res.sequence << ","
+                    << res.timestamp_us << ","
+                    << (res.valid && !res.predicted ? 1 : 0) << ","
+                    << (res.predicted ? 1 : 0) << ","
+                    << res.measured_position.x << ","
+                    << res.measured_position.y << ","
+                    << res.filtered_position.x << ","
+                    << res.filtered_position.y << ","
+                    << res.velocity.x << ","
+                    << res.velocity.y << "\n";
+            }
+            csv.close();
+            std::cout << "[ResultWriter] 结果已保存（仅CSV）" << std::endl;
+            return;
+        }
+
+        cv::VideoWriter writer;
+        bool writer_opened = false;
+        std::uint64_t expected_seq = 0;
+
+        TrackingResult res;
+        while (result_queue.wait_and_pop(res)) {
+            // 写 CSV
+            csv << res.sequence << ","
+                << res.timestamp_us << ","
+                << (res.valid && !res.predicted ? 1 : 0) << ","
+                << (res.predicted ? 1 : 0) << ","
+                << res.measured_position.x << ","
+                << res.measured_position.y << ","
+                << res.filtered_position.x << ","
+                << res.filtered_position.y << ","
+                << res.velocity.x << ","
+                << res.velocity.y << "\n";
+
+            // 读对应帧做可视化
+            cv::Mat frame;
+            // 跳过没有结果的帧（如果有）
+            while (expected_seq < res.sequence) {
+                vis_cap.read(frame);
+                expected_seq++;
+            }
+            if (expected_seq == res.sequence) {
+                vis_cap.read(frame);
+                expected_seq++;
+            }
+
+            if (!frame.empty()) {
+                cv::Mat vis = frame.clone();
+
+                // 检测位置：圆圈（绿色）
+                if (res.valid && !res.predicted) {
+                    cv::circle(vis, res.measured_position, 5, cv::Scalar(0, 255, 0), 2);
+                }
+
+                // 滤波/预测位置：十字
+                if (res.valid) {
+                    cv::Point2f p = res.filtered_position;
+                    cv::Scalar color = res.predicted ?
+                        cv::Scalar(0, 0, 255) : cv::Scalar(255, 0, 0);
+                    cv::line(vis, cv::Point(p.x - 8, p.y), cv::Point(p.x + 8, p.y), color, 2);
+                    cv::line(vis, cv::Point(p.x, p.y - 8), cv::Point(p.x, p.y + 8), color, 2);
+                }
+
+                if (!writer_opened) {
+                    writer.open(cfg.output_video,
+                                cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+                                30.0, cv::Size(vis.cols, vis.rows));
+                    writer_opened = true;
+                }
+                if (writer.isOpened()) writer.write(vis);
+            }
+        }
+
+        csv.close();
+        if (writer.isOpened()) writer.release();
+        std::cout << "[ResultWriter] 结果已保存" << std::endl;
+    });
+
+    // 启动四个线程
+    std::thread t_frame(&FrameSource::run, &frame_source);
+    std::thread t_detector(&ColorDetector::run, &color_detector);
+    std::thread t_tracker(&TargetTracker::run, &target_tracker);
+
+    // 等待所有线程
+    t_frame.join();
+    t_detector.join();
+    t_tracker.join();
+    t_writer.join();
+
+    std::cout << "\n=== 程序结束 ===" << std::endl;
+    return 0;
+}
