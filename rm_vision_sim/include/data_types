@@ -1,0 +1,29 @@
+#pragma once
+
+#include <cstdint>
+#include <opencv2/opencv.hpp>
+
+struct ImageFrame {
+    std::uint64_t sequence = 0;
+    std::int64_t  timestamp_us = 0;
+    cv::Mat image;
+};
+
+struct TargetObservation {
+    std::uint64_t sequence = 0;
+    std::int64_t  timestamp_us = 0;
+    bool detected = false;
+    cv::Point2f center{0.f, 0.f};
+    float radius = 0.f;
+    float confidence = 0.f;
+};
+
+struct TrackingResult {
+    std::uint64_t sequence = 0;
+    std::int64_t  timestamp_us = 0;
+    bool valid = false;
+    bool predicted = false;
+    cv::Point2f measured_position{0.f, 0.f};
+    cv::Point2f filtered_position{0.f, 0.f};
+    cv::Point2f velocity{0.f, 0.f};
+};
