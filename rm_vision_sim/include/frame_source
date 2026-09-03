@@ -1,0 +1,48 @@
+#pragma once
+
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include "data_types.h"
+#include "thread_safe_queue.h"
+#include "config_parser.h"
+
+class FrameSource {
+public:
+    FrameSource(const Config &cfg, ThreadSafeQueue<ImageFrame> &out)
+        : cfg_(cfg), out_(out) {}
+
+    void run() {
+        cv::VideoCapture cap(cfg_.input_video, cv::CAP_FFMPEG);
+        if (!cap.isOpened()) {
+            // 试试默认 backend
+            cap.open(cfg_.input_video);
+        }
+        if (!cap.isOpened()) {
+            std::cerr << "[FrameSource] 无法打开视频: " << cfg_.input_video << std::endl;
+            out_.close();
+            return;
+        }
+
+        double fps = cap.get(cv::CAP_PROP_FPS);
+        if (fps <= 0) fps = 30.0;
+        double us_per_frame = 1e6 / fps;
+
+        std::uint64_t seq = 0;
+        cv::Mat frame;
+        while (cap.read(frame)) {
+            ImageFrame img;
+            img.sequence = seq;
+            img.timestamp_us = static_cast<std::int64_t>(seq * us_per_frame);
+            img.image = frame.clone();
+            if (!out_.push(std::move(img))) break;
+            seq++;
+        }
+
+        std::cout << "[FrameSource] 读取完毕，共 " << seq << " 帧" << std::endl;
+        out_.close();
+    }
+
+private:
+    const Config &cfg_;
+    ThreadSafeQueue<ImageFrame> &out_;
+};
