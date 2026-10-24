@@ -1,0 +1,29 @@
+#pragma once
+#include "common.h"
+#include "motion.h"
+
+class Tracker {
+public:
+    Tracker(const GeometryModel& geometry, double fps);
+    void update(const std::vector<Bar>& bars, int frame);
+    const std::vector<Track>& tracks() const { return tracks_; }
+    const MotionState& state() const { return motion_.state(); }
+private:
+    struct Match {
+        double cost=0;
+        double sensitivity=0;
+        int count=0;
+        cv::Point2f shift{};
+        std::array<std::array<int,2>,3> indices{{{{-1,-1}},{{-1,-1}},{{-1,-1}}}};
+    };
+    GeometryModel geometry_;
+    Motion motion_;
+    double fps_;
+    int order_=1;
+    cv::Point2f translation_{};
+    std::vector<Track> tracks_;
+    std::array<cv::Point2f,3> corrections_{};
+    std::array<std::array<cv::Point2f,2>,3> heightCorrections_{};
+    std::array<std::vector<int>,3> groups_;
+    Match evaluate(const std::vector<Bar>& bars, double phase, int order) const;
+};
