@@ -1,0 +1,48 @@
+#include "renderer.h"
+#include <algorithm>
+#include <sstream>
+#include <iomanip>
+
+namespace {
+void dashed(cv::Mat& img, cv::Point2f a, cv::Point2f b, const cv::Scalar& color) {
+    const float len=static_cast<float>(cv::norm(b-a));
+    if(len<1) return;
+    for(float p=0;p<len;p+=8) {
+        cv::line(img,a+(b-a)*(p/len),a+(b-a)*(std::min(p+4,len)/len),color,1,cv::LINE_AA);
+    }
+}
+}
+cv::Mat Renderer::draw(const cv::Mat& frame, const std::vector<Track>& tracks,
+                      const MotionState& state, const GeometryModel& geometry,
+                      int frameIndex, double fps) {
+    (void)geometry;
+    cv::Mat canvas=frame.clone();
+    if(state.initialized) for(const auto& t:tracks) {
+        const cv::Scalar color=t.observed==2 ? cv::Scalar(40,255,40)
+                               : t.observed==1 ? cv::Scalar(255,220,30) : cv::Scalar(50,80,255);
+        for(int j=0;j<4;++j) {
+            if(t.observed) cv::line(canvas,t.box[j],t.box[(j+1)%4],color,1,cv::LINE_AA);
+            else dashed(canvas,t.box[j],t.box[(j+1)%4],color);
+        }
+        cv::circle(canvas,t.center,2,color,-1,cv::LINE_AA);
+        float top=1e8f,left=1e8f;
+        for(auto p:t.box) { top=std::min(top,p.y);left=std::min(left,p.x); }
+        const std::string label=std::to_string(t.id)+(t.observed==2?" D":t.observed==1?" S":" P");
+        cv::putText(canvas,label,{std::max(0,static_cast<int>(left)),std::max(15,static_cast<int>(top)-5)},
+                    cv::FONT_HERSHEY_SIMPLEX,.42,color,1,cv::LINE_AA);
+    }
+    const int height=78;
+    cv::Rect panel(0,std::max(0,canvas.rows-height),canvas.cols,std::min(height,canvas.rows));
+    cv::Mat patch=canvas(panel); cv::Mat tint(patch.size(),patch.type(),cv::Scalar(12,16,18));
+    cv::addWeighted(patch,.20,tint,.80,0,patch);
+    std::ostringstream status;
+    status<<std::fixed<<std::setprecision(1)<<"Frame "<<frameIndex<<"   "<<frameIndex/fps<<" s"
+          <<"   Speed "<<std::abs(state.omega)*180/kPi<<" deg/s"
+          <<"   "<<(state.dir>0?"CW (image)":state.dir<0?"CCW (image)":"STILL");
+    cv::putText(canvas,status.str(),{12,panel.y+23},0,.46,{225,235,235},1,cv::LINE_AA);
+    cv::putText(canvas,"D: two bars",{12,panel.y+48},0,.42,{40,255,40},1,cv::LINE_AA);
+    cv::putText(canvas,"S: one bar",{160,panel.y+48},0,.42,{255,220,30},1,cv::LINE_AA);
+    cv::putText(canvas,"P: predicted",{300,panel.y+48},0,.42,{50,80,255},1,cv::LINE_AA);
+    cv::putText(canvas,"IDs: 1 upper / 2 middle / 3 lower",{12,panel.y+68},0,.39,{180,190,190},1,cv::LINE_AA);
+    return canvas;
+}
