@@ -1,0 +1,17 @@
+#pragma once
+#include "common.h"
+// Scalar phase + angular velocity filter. Predictions never become measurements.
+class Motion {
+public:
+    explicit Motion(double fps);
+    void predict(int frame);
+    void correct(double measuredPhase, double measurementVariance);
+    MotionState& state() { return state_; }
+    const MotionState& state() const { return state_; }
+    double phaseVariance() const { return covariance_(0,0); }
+private:
+    double fps_;
+    int lastFrame_ = -1;
+    cv::Matx22d covariance_ = cv::Matx22d::eye();
+    MotionState state_;
+};
