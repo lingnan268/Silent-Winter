@@ -1,0 +1,64 @@
+cmake_minimum_required(VERSION 3.20)
+project(outpost_tracker LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+if(NOT WIN32)
+    message(FATAL_ERROR "This runner currently uses Windows Unicode filesystem APIs.")
+endif()
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc videoio highgui)
+
+add_executable(outpost_tracker
+    src/main.cpp
+    src/detector.cpp
+    src/model.cpp
+    src/tracker.cpp
+    src/motion.cpp
+    src/renderer.cpp
+)
+target_include_directories(outpost_tracker PRIVATE ${OpenCV_INCLUDE_DIRS})
+target_link_libraries(outpost_tracker PRIVATE ${OpenCV_LIBS})
+if(MSVC)
+    target_compile_options(outpost_tracker PRIVATE /utf-8 /W4 /EHsc)
+endif()
+
+include(CTest)
+set(OPENCV_RUNTIME_TARGETS outpost_tracker)
+if(BUILD_TESTING)
+    add_executable(tracker_test
+        tests/tracker_test.cpp
+        src/tracker.cpp
+        src/motion.cpp
+    )
+    target_include_directories(tracker_test PRIVATE src ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(tracker_test PRIVATE ${OpenCV_LIBS})
+    if(MSVC)
+        target_compile_options(tracker_test PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    add_test(NAME tracker_synthetic COMMAND $<TARGET_FILE:tracker_test>)
+    list(APPEND OPENCV_RUNTIME_TARGETS tracker_test)
+endif()
+
+# Copy the official SDK runtime and its FFmpeg plugin beside the executable.
+get_filename_component(OPENCV_SDK_ROOT "${OpenCV_DIR}" ABSOLUTE)
+file(GLOB_RECURSE OPENCV_RUNTIME_DLLS
+    "${OPENCV_SDK_ROOT}/opencv_world*.dll"
+    "${OPENCV_SDK_ROOT}/opencv_videoio_ffmpeg*.dll"
+)
+if(NOT OPENCV_RUNTIME_DLLS)
+    get_filename_component(OPENCV_SDK_PARENT "${OPENCV_SDK_ROOT}/../../.." ABSOLUTE)
+    file(GLOB_RECURSE OPENCV_RUNTIME_DLLS
+        "${OPENCV_SDK_PARENT}/opencv_world*.dll"
+        "${OPENCV_SDK_PARENT}/opencv_videoio_ffmpeg*.dll"
+    )
+endif()
+foreach(OPENCV_RUNTIME_TARGET IN LISTS OPENCV_RUNTIME_TARGETS)
+    foreach(OPENCV_DLL IN LISTS OPENCV_RUNTIME_DLLS)
+        add_custom_command(TARGET ${OPENCV_RUNTIME_TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${OPENCV_DLL}" "$<TARGET_FILE_DIR:${OPENCV_RUNTIME_TARGET}>"
+            VERBATIM
+        )
+    endforeach()
+endforeach()
