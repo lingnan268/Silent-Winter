@@ -1,0 +1,24 @@
+[CmdletBinding()]
+param(
+    [string]$InputVideo = '前哨站视频.mp4',
+    [string]$OutputVideo = 'results/stable.mp4',
+    [string]$Csv = 'results/tracks.csv',
+    [string]$Model = 'results/model.yml',
+    [ValidateSet('Release', 'Debug')][string]$Configuration = 'Release',
+    [switch]$NoGui,
+    [int]$MaskStart = -1,
+    [ValidateRange(0, 2147483647)][int]$MaskLength = 0,
+    [switch]$Build,
+    [string]$OpenCVDir = ''
+)
+$ErrorActionPreference = 'Stop'
+$taskExecutable = Join-Path $PSScriptRoot "bin\$Configuration\outpost_tracker.exe"
+if ($Build -or -not (Test-Path -LiteralPath $taskExecutable)) {
+    & (Join-Path $PSScriptRoot 'build.ps1') -Configuration $Configuration -OpenCVDir $OpenCVDir
+}
+$taskRunArgs = @('--input', $InputVideo, '--output', $OutputVideo, '--csv', $Csv, '--model', $Model)
+if ($NoGui) { $taskRunArgs += '--no-gui' }
+if ($MaskStart -ge 0) { $taskRunArgs += @('--mask-start', "$MaskStart") }
+if ($MaskLength -gt 0) { $taskRunArgs += @('--mask-length', "$MaskLength") }
+& $taskExecutable @taskRunArgs
+if ($LASTEXITCODE -ne 0) { throw "Tracking failed (exit $LASTEXITCODE)." }
