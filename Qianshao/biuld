@@ -1,0 +1,51 @@
+[CmdletBinding()]
+param(
+    [ValidateSet('Release', 'Debug')][string]$Configuration = 'Release',
+    [string]$OpenCVDir = '',
+    [string]$BuildDir = '',
+    [switch]$RunTests,
+    [switch]$Rebuild
+)
+$ErrorActionPreference = 'Stop'
+$taskProjectRoot = $PSScriptRoot
+if (-not $BuildDir) {
+    $BuildDir = Join-Path (Split-Path $taskProjectRoot -Parent) '.build\outpost'
+}
+$BuildDir = [IO.Path]::GetFullPath($BuildDir)
+if (-not $OpenCVDir) {
+    if ($env:OpenCV_DIR) { $OpenCVDir = $env:OpenCV_DIR }
+    elseif (Test-Path -LiteralPath 'C:\opencv\build\OpenCVConfig.cmake') { $OpenCVDir = 'C:\opencv\build' }
+    else { throw 'Pass -OpenCVDir <OpenCV SDK build directory>, or set OpenCV_DIR.' }
+}
+$OpenCVDir = [IO.Path]::GetFullPath($OpenCVDir)
+if (-not (Test-Path -LiteralPath (Join-Path $OpenCVDir 'OpenCVConfig.cmake'))) {
+    throw "OpenCVConfig.cmake was not found in '$OpenCVDir'."
+}
+$taskCMake = (Get-Command cmake -ErrorAction Stop).Source
+& $taskCMake -S $taskProjectRoot -B $BuildDir -G 'Visual Studio 17 2022' -A x64 "-DOpenCV_DIR=$OpenCVDir" '-DBUILD_TESTING=ON'
+if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed (exit $LASTEXITCODE)." }
+# Serial MSBuild also works in restricted Windows process environments.
+$taskBuildArgs = @('--build', $BuildDir, '--config', $Configuration, '--parallel', '1')
+if ($Rebuild) { $taskBuildArgs += '--clean-first' }
+& $taskCMake @taskBuildArgs
+if ($LASTEXITCODE -ne 0) { throw "C++ build failed (exit $LASTEXITCODE)." }
+if ($RunTests) {
+    $taskCTest = Join-Path (Split-Path $taskCMake -Parent) 'ctest.exe'
+    & $taskCTest --test-dir $BuildDir -C $Configuration --output-on-failure
+    if ($LASTEXITCODE -ne 0) { throw "Regression tests failed (exit $LASTEXITCODE)." }
+}
+$taskBuiltDir = Join-Path $BuildDir $Configuration
+$taskOutputDir = Join-Path $taskProjectRoot "bin\$Configuration"
+New-Item -ItemType Directory -Path $taskOutputDir -Force | Out-Null
+foreach ($taskName in @('outpost_tracker.exe', 'tracker_test.exe')) {
+    Copy-Item -LiteralPath (Join-Path $taskBuiltDir $taskName) -Destination $taskOutputDir -Force
+}
+foreach ($taskDll in Get-ChildItem -LiteralPath $taskBuiltDir -Filter '*.dll') {
+    if ($taskDll.Name -match '^opencv_world\d+(d)?\.dll$') {
+        $taskIsDebug = [bool]$Matches[1]
+        if ($taskIsDebug -ne ($Configuration -eq 'Debug')) { continue }
+    }
+    Copy-Item -LiteralPath $taskDll.FullName -Destination $taskOutputDir -Force
+}
+Write-Host "Built: $(Join-Path $taskOutputDir 'outpost_tracker.exe')"
+Write-Host "Build cache: $BuildDir"
