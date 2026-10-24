@@ -1,0 +1,16 @@
+#pragma once
+#include "common.h"
+
+// Measure visible light bars only. Plate pairing and temporarily hidden bars
+// are handled by the geometric tracker, not fabricated by this detector.
+class Detector {
+public:
+    // An empty ROI selects the complete frame. Coordinates are in the input
+    // image, and any requested ROI is clipped to its bounds before use.
+    explicit Detector(cv::Rect roi = {});
+    void setROI(cv::Rect roi) { roi_ = roi; }
+    std::vector<Bar> detect(const cv::Mat& frame);
+
+private:
+    cv::Rect roi_;
+};
