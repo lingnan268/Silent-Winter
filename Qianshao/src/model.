@@ -1,0 +1,8 @@
+#pragma once
+#include "common.h"
+
+// Calibrates the three height levels from actual measured light bars.
+GeometryModel calibrateGeometry(const std::vector<std::vector<Bar>>& frames,
+                                cv::Size imageSize, std::string& error);
+bool saveGeometry(const GeometryModel& model, const std::string& path,
+                  std::string& error);
