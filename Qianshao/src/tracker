@@ -1,0 +1,179 @@
+#include "tracker.h"
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+
+namespace {
+double sq(cv::Point2f p) { return p.dot(p); }
+cv::Point2f halfAt(const Orbit& o, double phase) {
+    return o.halfHeight + o.heightCos*static_cast<float>(std::cos(phase))
+                        + o.heightSin*static_cast<float>(std::sin(phase));
+}
+}
+
+Tracker::Tracker(const GeometryModel& geometry, double fps)
+    : geometry_(geometry), motion_(fps), fps_(fps) {
+    if (!geometry.ready) throw std::invalid_argument("Geometry is not calibrated");
+    for (int k=0;k<3;++k) { Track t; t.id=k+1; tracks_.push_back(t); }
+}
+
+Tracker::Match Tracker::evaluate(const std::vector<Bar>& bars, double phase, int order) const {
+    Match result;
+    result.shift=translation_;
+    constexpr double unmatchedCost=144.0;
+    bool fitTranslation=false;
+    // Jointly estimate slow image translation and rotor phase. The support sways
+    // when rotation stops; a fixed image origin would otherwise reject real bars.
+    for(int iteration=0;iteration<3;++iteration) {
+        result.cost=0; result.count=0;
+        int measuredLevels=0;
+        cv::Point2f shiftSum(0,0);
+        for (int k=0;k<3;++k) {
+            const auto& o=geometry_.orbits[k];
+            const double a=phase+order*k*2*kPi/3;
+            std::array<cv::Point2f,2> model{{o.project(a-o.delta),o.project(a+o.delta)}};
+            const auto p=std::array<cv::Point2f,2>{{model[0]+result.shift,model[1]+result.shift}};
+            double best=unmatchedCost*groups_[k].size();
+            int left=-1,right=-1;
+            const int n=static_cast<int>(groups_[k].size());
+            for (int l=-1;l<n;++l) for (int r=-1;r<n;++r) {
+                if (l>=0 && l==r) continue;
+                double cost=unmatchedCost*(n-(l>=0)-(r>=0));
+                if (l>=0) cost+=sq(bars[groups_[k][l]].center-p[0]);
+                if (r>=0) cost+=sq(bars[groups_[k][r]].center-p[1]);
+                if (cost<best) { best=cost; left=l; right=r; }
+            }
+            result.cost+=best;
+            measuredLevels+=(left>=0 || right>=0);
+            for (int s=0;s<2;++s) {
+                const int local=s ? right:left;
+                result.indices[k][s]=local<0 ? -1:groups_[k][local];
+                if(local<0) continue;
+                ++result.count; shiftSum+=bars[groups_[k][local]].center-model[s];
+            }
+        }
+        // A single plate cannot separately determine rotation and translation.
+        // Freeze translation in that case rather than fitting away real motion.
+        fitTranslation=result.count>=3 && measuredLevels>=2;
+        if(iteration<2 && fitTranslation) {
+            auto change=shiftSum*(1.0f/result.count)-translation_;
+            const float limit=std::max(3.0f,geometry_.orbits[1].halfHeight.y);
+            const float length=static_cast<float>(cv::norm(change));
+            if(length>limit) change*=limit/length;
+            result.shift=translation_+change;
+        }
+    }
+    result.cost+=0.12*sq(result.shift-translation_);
+    cv::Point2f derivativeSum(0,0);
+    for(int k=0;k<3;++k) {
+        const auto& o=geometry_.orbits[k];
+        const double a=phase+order*k*2*kPi/3;
+        for(int s=0;s<2;++s) if(result.indices[k][s]>=0) {
+            const double b=a+(s?o.delta:-o.delta);
+            const auto derivative=o.u*static_cast<float>(-std::sin(b))+o.v*static_cast<float>(std::cos(b));
+            result.sensitivity+=sq(derivative); derivativeSum+=derivative;
+        }
+    }
+    if(fitTranslation && result.count) result.sensitivity-=sq(derivativeSum)/result.count;
+    return result;
+}
+
+void Tracker::update(const std::vector<Bar>& bars, int frame) {
+    motion_.predict(frame);
+    auto& state=motion_.state();
+    for (auto& g:groups_) g.clear();
+    for (int i=0;i<static_cast<int>(bars.size());++i) {
+        int best=-1; double error=10.0;
+        for (int k=0;k<3;++k) {
+            const double d=geometry_.orbits[k].distance(bars[i].center-translation_);
+            if (d<error) { error=d; best=k; }
+        }
+        if (best>=0) groups_[best].push_back(i);
+    }
+    double bestPhase=state.phase, bestCost=std::numeric_limits<double>::infinity();
+    int bestOrder=order_;
+    const bool initialized=state.initialized;
+    const double span=initialized ? std::clamp(4.0*std::sqrt(motion_.phaseVariance())+0.25,0.30,1.0) : kPi;
+    const double base=initialized ? state.phase : 0.0;
+    // If each plate exposes the same single edge, swapping all edge labels and
+    // shifting phase by 2*delta has almost identical image evidence. Temporal
+    // likelihood selects the continuous branch, including just after a gap.
+    const double priorWeight=initialized ? 0.36/std::clamp(motion_.phaseVariance(),0.003,0.18):0;
+    const auto objective=[&](double phase,int order) {
+        const double innovation=wrapAngle(phase-base);
+        return evaluate(bars,phase,order).cost+priorWeight*innovation*innovation;
+    };
+    const double step=initialized ? 0.008 : 0.02;
+    const int steps=static_cast<int>(std::ceil(2*span/step));
+    for (int order : {-1,1}) {
+        if (initialized && order!=order_) continue;
+        for (int i=0;i<=steps;++i) {
+            const double phase=base-span+2*span*i/steps;
+            const double cost=objective(phase,order);
+            if (cost<bestCost) {
+                bestCost=cost; bestPhase=phase; bestOrder=order;
+            }
+        }
+    }
+    double lo=bestPhase-step, hi=bestPhase+step;
+    for (int it=0;it<18;++it) {
+        const double a=lo+(hi-lo)/3,b=hi-(hi-lo)/3;
+        if (objective(a,bestOrder)<objective(b,bestOrder)) hi=b;
+        else lo=a;
+    }
+    bestPhase=(lo+hi)/2;
+    Match match=evaluate(bars,bestPhase,bestOrder);
+    double measuredError=0;
+    for(int k=0;k<3;++k) for(int s=0;s<2;++s) {
+        const int i=match.indices[k][s]; if(i<0) continue;
+        const auto& o=geometry_.orbits[k];
+        measuredError+=sq(bars[i].center-match.shift-o.project(bestPhase+bestOrder*k*2*kPi/3+(s?o.delta:-o.delta)));
+    }
+    if (match.count>=2 && match.sensitivity>20) {
+        order_=bestOrder;
+        translation_=translation_*0.3f+match.shift*0.7f;
+        const double sigma2=std::max(0.36, measuredError/std::max(1,2*match.count-1));
+        motion_.correct(bestPhase,sigma2/match.sensitivity);
+    } else if (!initialized) {
+        state.visible=0; return;
+    } else {
+        // One marker does not disambiguate the two edges reliably.
+        match=Match{};
+    }
+    state.visible=0; state.residual=match.count ? std::sqrt(measuredError/match.count):0;
+    for (int k=0;k<3;++k) {
+        auto& t=tracks_[k]; const auto& o=geometry_.orbits[k];
+        t.phase=state.phase+order_*k*2*kPi/3;
+        std::array<cv::Point2f,2> ends{{o.project(t.phase-o.delta)+translation_,o.project(t.phase+o.delta)+translation_}};
+        cv::Point2f correction(0,0); int count=0;
+        for (int s=0;s<2;++s) {
+            const int i=match.indices[k][s];
+            if (i<0) { heightCorrections_[k][s]*=0.85f; continue; }
+            correction+=bars[i].center-ends[s]; ++count;
+            const auto desired=bars[i].half-halfAt(o,t.phase+(s?o.delta:-o.delta));
+            heightCorrections_[k][s]=heightCorrections_[k][s]*0.6f+desired*0.4f;
+        }
+        t.observed=count;
+        if (count) {
+            ++state.visible; t.miss=0; correction*=1.0f/count;
+            corrections_[k]=corrections_[k]*0.4f+correction*0.6f;
+        } else { ++t.miss; corrections_[k]*=0.82f; }
+        auto h0=halfAt(o,t.phase-o.delta)+heightCorrections_[k][0];
+        auto h1=halfAt(o,t.phase+o.delta)+heightCorrections_[k][1];
+        ends[0]+=corrections_[k]; ends[1]+=corrections_[k];
+        if (ends[0].x>ends[1].x) { std::swap(ends[0],ends[1]); std::swap(h0,h1); }
+        cv::Point2f tangent=ends[1]-ends[0];
+        const float length=static_cast<float>(cv::norm(tangent));
+        tangent=length>0.1f ? tangent/length : cv::Point2f(1,0);
+        // Padding follows measured light-bar dimensions and scales with the input.
+        const float margin=std::max(1.5f,o.barWidth*.42f);
+        const auto extend=[](cv::Point2f h) {
+            const float n=static_cast<float>(cv::norm(h)); return h*(1.0f+2.0f/std::max(n,1.0f));
+        };
+        h0=extend(h0); h1=extend(h1);
+        t.box={{ends[0]-h0-tangent*margin,ends[1]-h1+tangent*margin,
+                ends[1]+h1+tangent*margin,ends[0]+h0-tangent*margin}};
+        t.center=(ends[0]+ends[1])*.5f;
+        t.residual=count ? cv::norm(correction):0;
+    }
+}
