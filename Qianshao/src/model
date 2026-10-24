@@ -1,0 +1,323 @@
+#include "model.h"
+#include <algorithm>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <set>
+#include <sstream>
+
+namespace {
+double median(std::vector<double> values) {
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    const size_t n = values.size();
+    return n % 2 ? values[n / 2] : (values[n / 2 - 1] + values[n / 2]) * 0.5;
+}
+
+bool finitePoint(cv::Point2f p) {
+    return std::isfinite(p.x) && std::isfinite(p.y);
+}
+
+bool measuredBar(const Bar& bar, cv::Size size) {
+    return finitePoint(bar.center) && finitePoint(bar.half) &&
+           std::isfinite(bar.width) && std::isfinite(bar.height) &&
+           bar.width > 0 && bar.height > 0 && cv::norm(bar.half) > 0 &&
+           bar.center.x >= 0 && bar.center.x < size.width &&
+           bar.center.y >= 0 && bar.center.y < size.height;
+}
+
+bool fitOrbit(const std::vector<cv::Point2f>& points, Orbit& orbit) {
+    if (points.size() < 5) return false;
+    try {
+        const auto ellipse = cv::fitEllipse(points);
+        if (!finitePoint(ellipse.center) || !std::isfinite(ellipse.angle)) return false;
+        const double major = std::max(ellipse.size.width, ellipse.size.height) * 0.5;
+        const double minor = std::min(ellipse.size.width, ellipse.size.height) * 0.5;
+        if (!std::isfinite(major) || !std::isfinite(minor) || minor <= 0.5) return false;
+        double angle = ellipse.angle * kPi / 180.0;
+        if (ellipse.size.height > ellipse.size.width) angle += kPi * 0.5;
+        cv::Point2f direction(static_cast<float>(std::cos(angle)), static_cast<float>(std::sin(angle)));
+        if (direction.x < 0) direction = -direction;
+        orbit.center = ellipse.center;
+        orbit.u = direction * static_cast<float>(major);
+        // Positive determinant gives a downward short axis for rightward u.
+        orbit.v = cv::Point2f(-direction.y, direction.x) * static_cast<float>(minor);
+        return finitePoint(orbit.u) && finitePoint(orbit.v);
+    } catch (const cv::Exception&) {
+        return false;
+    }
+}
+
+bool plausible(const Orbit& orbit, const std::vector<cv::Point2f>& points,
+               cv::Size imageSize) {
+    const auto bounds = cv::boundingRect(points);
+    const double major = cv::norm(orbit.u), minor = cv::norm(orbit.v);
+    // Constraints scale with measured support and image size, never a stored orbit.
+    if (major < bounds.width * 0.30 || major > bounds.width * 1.10 ||
+        minor < 2.0 || minor > bounds.height * 0.80 ||
+        major / minor < 2.0 || major / minor > 35.0 ||
+        major > imageSize.width || minor > imageSize.height * 0.5) return false;
+    if (std::abs(orbit.u.y / major) > 0.35) return false;
+    return orbit.center.x >= bounds.x - bounds.width * 0.15 &&
+           orbit.center.x <= bounds.x + bounds.width * 1.15 &&
+           orbit.center.y >= bounds.y - bounds.height * 0.2 &&
+           orbit.center.y <= bounds.y + bounds.height * 1.2;
+}
+
+bool robustOrbit(const std::vector<cv::Point2f>& points, cv::Size imageSize,
+                 std::mt19937& generator, Orbit& result) {
+    if (points.size() < 18) return false;
+    double bestScore = -1;
+    std::uniform_int_distribution<size_t> pick(0, points.size() - 1);
+    for (int trial = 0; trial < 501; ++trial) {
+        std::vector<cv::Point2f> sample;
+        if (trial == 0) sample = points;
+        else {
+            std::set<size_t> indices;
+            while (indices.size() < 8) indices.insert(pick(generator));
+            for (size_t index : indices) sample.push_back(points[index]);
+        }
+        Orbit candidate;
+        if (!fitOrbit(sample, candidate) || !plausible(candidate, points, imageSize)) continue;
+        double score = 0;
+        for (auto point : points) {
+            const double residual = candidate.distance(point);
+            score += std::max(0.0, 1.0 - residual * residual / 4.0);
+        }
+        if (score > bestScore) { bestScore = score; result = candidate; }
+    }
+    if (bestScore < 12) return false;
+    for (int iteration = 0; iteration < 7; ++iteration) {
+        std::vector<double> residuals;
+        for (auto point : points) {
+            const double residual = result.distance(point);
+            if (residual < 3.0) residuals.push_back(residual);
+        }
+        if (residuals.size() < 12) return false;
+        const double location = median(residuals);
+        for (auto& residual : residuals) residual = std::abs(residual - location);
+        const double gate = std::clamp(location + 2.8 * 1.4826 * median(residuals), 1.2, 3.0);
+        std::vector<cv::Point2f> inliers;
+        for (auto point : points) if (result.distance(point) < gate) inliers.push_back(point);
+        Orbit refined;
+        if (inliers.size() < 12 || !fitOrbit(inliers, refined) ||
+            !plausible(refined, points, imageSize)) break;
+        result = refined;
+    }
+    result.samples = 0;
+    for (auto point : points) if (result.distance(point) < 2.5) ++result.samples;
+    return result.samples >= 18;
+}
+
+int closestOrbit(const GeometryModel& model, cv::Point2f point, double gate = 2.8) {
+    int level = -1;
+    for (int k = 0; k < 3; ++k) {
+        const double residual = model.orbits[k].distance(point);
+        if (residual < gate) { gate = residual; level = k; }
+    }
+    return level;
+}
+
+bool estimatePlateShape(const std::vector<std::vector<Bar>>& frames, cv::Size imageSize,
+                        GeometryModel& model, int level, std::string& error) {
+    Orbit& orbit = model.orbits[level];
+    std::vector<double> widths, halfX, halfY, allPairs, alignedPairs;
+    std::vector<cv::Vec3d> heightInputs;
+    std::vector<cv::Vec2d> heightOutputs;
+    for (const auto& frame : frames) {
+        std::vector<const Bar*> bars;
+        for (const auto& bar : frame) {
+            if (!measuredBar(bar, imageSize) || closestOrbit(model, bar.center) != level) continue;
+            bars.push_back(&bar);
+            widths.push_back(bar.width);
+            const float sign = bar.half.y < 0 ? -1.f : 1.f;
+            halfX.push_back(bar.half.x * sign);
+            halfY.push_back(bar.half.y * sign);
+            const double phase = orbit.phaseOf(bar.center);
+            heightInputs.emplace_back(1.0, std::cos(phase), std::sin(phase));
+            heightOutputs.emplace_back(bar.half.x * sign, bar.half.y * sign);
+        }
+        for (size_t i = 0; i < bars.size(); ++i) for (size_t j = i + 1; j < bars.size(); ++j) {
+            const auto& a = *bars[i]; const auto& b = *bars[j];
+            const double separation = std::abs(wrapAngle(orbit.phaseOf(a.center) - orbit.phaseOf(b.center)));
+            const double degrees = separation * 180.0 / kPi;
+            if (degrees < 8 || degrees > 60) continue;
+            allPairs.push_back(separation);
+            cv::Point2f axis = a.half + b.half;
+            const double length = cv::norm(axis);
+            if (length <= 1e-5) continue;
+            axis *= static_cast<float>(1.0 / length);
+            const double axialOffset = std::abs((a.center - b.center).dot(axis));
+            if (axialOffset < 0.55 * (a.height + b.height) * 0.5) alignedPairs.push_back(separation);
+        }
+    }
+    // A mode suppresses unrelated reflectors and occasional false pairings.
+    const auto& pairs = alignedPairs.size() >= 8 ? alignedPairs : allPairs;
+    if (pairs.size() < 6 || widths.size() < 18) {
+        error = "Height level " + std::to_string(level + 1) + ": insufficient measured light-bar pairs";
+        return false;
+    }
+    double peak = 0, bestSupport = -1;
+    for (int degree = 8; degree <= 60; ++degree) {
+        const double center = degree * kPi / 180.0;
+        double support = 0;
+        for (double pair : pairs) {
+            const double difference = std::abs(pair - center) * 180.0 / kPi;
+            support += std::max(0.0, 1.0 - difference / 4.0);
+        }
+        if (support > bestSupport) { bestSupport = support; peak = center; }
+    }
+    std::vector<double> separationInliers;
+    for (double pair : pairs) if (std::abs(pair - peak) < 5.0 * kPi / 180.0) separationInliers.push_back(pair);
+    if (separationInliers.size() < 6) {
+        error = "Height level " + std::to_string(level + 1) + ": ambiguous light-bar separation";
+        return false;
+    }
+    orbit.delta = static_cast<float>(median(separationInliers) * 0.5);
+    orbit.barWidth = static_cast<float>(median(widths));
+    orbit.halfHeight = {static_cast<float>(median(halfX)), static_cast<float>(median(halfY))};
+    // Fit both components of the measured half axis as a first harmonic.
+    // The orbit covers actual measured phases; predictions are never fitted.
+    std::vector<bool> keep(heightInputs.size(), true);
+    cv::Mat coefficients;
+    for (int iteration = 0; iteration < 4; ++iteration) {
+        const int count = static_cast<int>(std::count(keep.begin(), keep.end(), true));
+        if (count < 18) break;
+        cv::Mat x(count, 3, CV_64F), y(count, 2, CV_64F);
+        int row = 0;
+        for (size_t i = 0; i < keep.size(); ++i) if (keep[i]) {
+            for (int j = 0; j < 3; ++j) x.at<double>(row,j) = heightInputs[i][j];
+            for (int j = 0; j < 2; ++j) y.at<double>(row,j) = heightOutputs[i][j];
+            ++row;
+        }
+        cv::Mat singularValues;
+        cv::SVD::compute(x, singularValues);
+        if (singularValues.at<double>(2) < singularValues.at<double>(0) * 0.02) break;
+        cv::Mat fitted;
+        if (!cv::solve(x, y, fitted, cv::DECOMP_SVD)) break;
+        coefficients = fitted;
+        std::vector<double> residuals;
+        for (size_t i = 0; i < keep.size(); ++i) {
+            cv::Vec2d predicted(0,0);
+            for (int j = 0; j < 3; ++j) for (int k = 0; k < 2; ++k)
+                predicted[k] += heightInputs[i][j] * fitted.at<double>(j,k);
+            residuals.push_back(cv::norm(predicted - heightOutputs[i]));
+        }
+        const double location = median(residuals);
+        auto deviations = residuals;
+        for (auto& residual : deviations) residual = std::abs(residual - location);
+        const double gate = std::max(1.0, location + 3.0 * 1.4826 * median(deviations));
+        for (size_t i = 0; i < keep.size(); ++i) keep[i] = residuals[i] < gate;
+    }
+    if (!coefficients.empty()) {
+        const cv::Point2f offset(static_cast<float>(coefficients.at<double>(0,0)), static_cast<float>(coefficients.at<double>(0,1)));
+        const cv::Point2f cosine(static_cast<float>(coefficients.at<double>(1,0)), static_cast<float>(coefficients.at<double>(1,1)));
+        const cv::Point2f sine(static_cast<float>(coefficients.at<double>(2,0)), static_cast<float>(coefficients.at<double>(2,1)));
+        // Reject an unconstrained fit whose hidden-side extrapolation reverses a bar.
+        if (offset.y > std::hypot(cosine.y,sine.y) &&
+            cv::norm(cosine) + cv::norm(sine) < cv::norm(offset) * 1.5) {
+            orbit.halfHeight = offset; orbit.heightCos = cosine; orbit.heightSin = sine;
+        }
+    }
+    return finitePoint(orbit.halfHeight) && orbit.halfHeight.y > 0 && orbit.delta > 0;
+}
+} // namespace
+
+GeometryModel calibrateGeometry(const std::vector<std::vector<Bar>>& frames,
+                                cv::Size imageSize, std::string& error) {
+    GeometryModel model;
+    error.clear();
+    if (imageSize.width <= 0 || imageSize.height <= 0) {
+        error = "Invalid video dimensions";
+        return model;
+    }
+    std::set<std::pair<int,int>> occupied;
+    std::vector<cv::Point2f> points;
+    for (const auto& frame : frames) for (const auto& bar : frame) {
+        if (!measuredBar(bar, imageSize)) continue;
+        const std::pair<int,int> cell(cvRound(bar.center.x), cvRound(bar.center.y));
+        if (occupied.insert(cell).second) points.emplace_back(static_cast<float>(cell.first), static_cast<float>(cell.second));
+    }
+    if (points.size() < 60) {
+        error = "Too few distinct measured positions to calibrate three height levels";
+        return model;
+    }
+    std::vector<double> ys;
+    for (auto point : points) ys.push_back(point.y);
+    std::sort(ys.begin(), ys.end());
+    std::array<double,3> levels{ys[static_cast<size_t>(0.15 * (ys.size()-1))],
+                                ys[static_cast<size_t>(0.50 * (ys.size()-1))],
+                                ys[static_cast<size_t>(0.85 * (ys.size()-1))]};
+    std::array<std::vector<cv::Point2f>,3> clusters;
+    for (int iteration = 0; iteration < 40; ++iteration) {
+        for (auto& cluster : clusters) cluster.clear();
+        for (auto point : points) {
+            int nearest = 0;
+            for (int k = 1; k < 3; ++k)
+                if (std::abs(point.y - levels[k]) < std::abs(point.y - levels[nearest])) nearest = k;
+            clusters[nearest].push_back(point);
+        }
+        double change = 0;
+        for (int k = 0; k < 3; ++k) {
+            if (clusters[k].size() < 18) { error = "Insufficient vertical separation or support for three height levels"; return model; }
+            double mean = 0;
+            for (auto point : clusters[k]) mean += point.y;
+            mean /= clusters[k].size();
+            change += std::abs(mean - levels[k]); levels[k] = mean;
+        }
+        if (change < 1e-3) break;
+    }
+    std::mt19937 generator(1841);
+    for (int k = 0; k < 3; ++k) {
+        if (!robustOrbit(clusters[k], imageSize, generator, model.orbits[k])) {
+            error = "Height level " + std::to_string(k + 1) + ": ellipse fit is degenerate or lacks measured support";
+            return model;
+        }
+    }
+    // Reassign by geometric residual to recover arc points cut by y clustering.
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        for (auto& cluster : clusters) cluster.clear();
+        for (auto point : points) {
+            const int level = closestOrbit(model, point);
+            if (level >= 0) clusters[level].push_back(point);
+        }
+        for (int k = 0; k < 3; ++k) {
+            Orbit candidate;
+            if (robustOrbit(clusters[k], imageSize, generator, candidate)) model.orbits[k] = candidate;
+        }
+    }
+    std::sort(model.orbits.begin(), model.orbits.end(), [](const Orbit& a, const Orbit& b) { return a.center.y < b.center.y; });
+    for (int k = 0; k < 3; ++k) {
+        if (k > 0 && model.orbits[k].center.y - model.orbits[k-1].center.y <
+            0.6 * (cv::norm(model.orbits[k].v) + cv::norm(model.orbits[k-1].v))) {
+            error = "Fitted height levels overlap too much to assign stable identities";
+            return model;
+        }
+        if (!estimatePlateShape(frames, imageSize, model, k, error)) {
+            if (error.empty()) error = "Height level " + std::to_string(k + 1) + ": invalid measured plate shape";
+            return model;
+        }
+    }
+    model.ready = true;
+    return model;
+}
+
+bool saveGeometry(const GeometryModel& model, const std::string& path, std::string& error) {
+    error.clear();
+    if (!model.ready) { error = "Geometry model is not calibrated"; return false; }
+    try {
+        cv::FileStorage output(path, cv::FileStorage::WRITE | cv::FileStorage::FORMAT_JSON);
+        if (!output.isOpened()) { error = "Cannot open geometry output: " + path; return false; }
+        output << "source" << "measured light-bar centers" << "ready" << 1 << "orbits" << "[";
+        for (const auto& orbit : model.orbits) {
+            output << "{" << "center" << orbit.center << "u" << orbit.u << "v" << orbit.v
+                   << "delta_radians" << orbit.delta << "half_height" << orbit.halfHeight
+                   << "height_cos" << orbit.heightCos << "height_sin" << orbit.heightSin
+                   << "bar_width" << orbit.barWidth << "unique_inliers" << orbit.samples << "}";
+        }
+        output << "]";
+        return true;
+    } catch (const cv::Exception& exception) {
+        error = exception.what(); return false;
+    }
+}
