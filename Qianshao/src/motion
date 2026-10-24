@@ -1,0 +1,33 @@
+#include "motion.h"
+#include <algorithm>
+#include <stdexcept>
+
+Motion::Motion(double fps) : fps_(fps) {
+    if (!(fps > 0) || !std::isfinite(fps)) throw std::invalid_argument("Invalid FPS");
+}
+void Motion::predict(int frame) {
+    const double dt = lastFrame_ < 0 ? 0.0 : (frame-lastFrame_)/fps_;
+    lastFrame_ = frame;
+    if (!state_.initialized || dt <= 0) return;
+    state_.phase += state_.omega*dt;
+    const cv::Matx22d F(1,dt,0,1);
+    // Acceleration is process uncertainty, not a prescribed rotation speed.
+    const double a2=36.0, d2=dt*dt, d3=d2*dt, d4=d2*d2;
+    covariance_=F*covariance_*F.t()+cv::Matx22d(d4*.25,d3*.5,d3*.5,d2)*a2;
+}
+void Motion::correct(double z, double variance) {
+    variance=std::clamp(variance,1e-6,0.1);
+    if (!state_.initialized) {
+        state_.phase=z; state_.omega=0; state_.initialized=true;
+        covariance_=cv::Matx22d(variance,0,0,25);
+        return;
+    }
+    z=state_.phase+wrapAngle(z-state_.phase);
+    const double innovation=z-state_.phase, S=covariance_(0,0)+variance;
+    const cv::Vec2d K(covariance_(0,0)/S,covariance_(1,0)/S);
+    state_.phase+=K[0]*innovation; state_.omega+=K[1]*innovation;
+    const cv::Matx22d A(1-K[0],0,-K[1],1);
+    // Joseph update retains positive semidefinite covariance after long gaps.
+    covariance_=A*covariance_*A.t()+cv::Matx22d(K[0]*K[0],K[0]*K[1],K[1]*K[0],K[1]*K[1])*variance;
+    state_.dir=std::abs(state_.omega)<0.04 ? 0 : (state_.omega>0 ? 1:-1);
+}
