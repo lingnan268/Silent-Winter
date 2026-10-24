@@ -1,0 +1,81 @@
+# 前哨站装甲板跟踪
+
+基于 C++17 和 OpenCV 4，在完整原视频上标记三块装甲板，保持编号并估计旋转方向、角速度。当前方案采用离线两遍处理：先从整段视频的实测灯条拟合几何，再按时间顺序跟踪；角速度随观测更新。
+
+## 先看结果
+
+打开 **`results/stable_preview.mp4`**，这是未裁剪的完整识别视频，668 × 688、30 FPS、925 帧，约 31 秒。
+
+- 绿色 `D`：检测到本板两根灯条。
+- 青色 `S`：检测到一根灯条，结合模型补全另一侧。
+- 红色虚线 `P`：当前没有匹配观测，显示预测位置。
+- 编号 `1 / 2 / 3`：分别对应上、中、下安装高度。
+
+## 目录
+
+```text
+前哨站/
+├─ src/                    C++ 源码和头文件
+├─ tests/                  合成跟踪回归测试
+├─ docs/
+│  ├─ 作业要求.png           原始要求截图
+│  ├─ 算法说明.md           灯条检测、建模与跟踪
+│  └─ 验证说明.md           实测结果和复现方式
+├─ results/
+│  ├─ stable_preview.mp4    完整识别视频（H.264）
+│  ├─ tracks.csv            逐帧中心、四角、编号和运动状态
+│  ├─ model.yml             从视频测得的几何参数
+│  └─ validation.json       验证统计
+├─ bin/Release/             程序和运行库，仅可运行包包含
+├─ licenses/                随附 OpenCV 运行库的许可文件
+├─ 前哨站视频.mp4            原始输入视频
+├─ CMakeLists.txt
+├─ build.ps1
+├─ run.ps1
+└─ 运行查看.cmd
+```
+
+调试图片、旧源码、旧识别视频、裁剪对比、重复导出、遮挡实验中间文件和 OpenCV SDK 不放入交付包。
+
+包内 `文件清单.sha256` 列出文件校验值，可用于核对解压内容。
+
+## 运行
+
+**可运行包**：Windows x64 上双击 `运行查看.cmd`，程序重新处理输入视频并通过 `cv::imshow` 播放；按 Esc 或 Q 结束。随包包含本次验证的 Release 程序和必要 DLL。
+
+无窗口处理：
+
+```powershell
+.\run.ps1 -NoGui
+```
+
+重新处理会写出 `results/stable.mp4`、`results/tracks.csv` 和 `results/model.yml`；随附的完整 H.264 预览 `stable_preview.mp4` 保留。
+
+自定义输出：
+
+```powershell
+.\run.ps1 -NoGui -OutputVideo 'results/my_result.mp4' -Csv 'results/my_tracks.csv' -Model 'results/my_model.yml'
+```
+
+## 编译源码包
+
+需要 Windows、Visual Studio 2022 C++ Build Tools、CMake 3.20 以上和 OpenCV 4 的 Windows x64 SDK。本次验证使用 OpenCV 4.13.0；SDK 不随交付包提供。
+
+```powershell
+.\build.ps1 -OpenCVDir 'C:\opencv\build' -RunTests
+.\run.ps1
+```
+
+`-OpenCVDir` 应指向包含 `OpenCVConfig.cmake` 的目录，也可通过环境变量 `OpenCV_DIR` 指定。编译结果放入 `bin/Release/`；缓存默认放在项目旁的 `.build/outpost/`，可通过 `-BuildDir` 改变。源码包首次运行前需要完成编译。
+
+可运行包可直接执行回归测试：
+
+```powershell
+.\bin\Release\tracker_test.exe
+```
+
+## 结果数据
+
+`tracks.csv` 每帧每块板一行，共 2775 行。`observed=0/1/2` 对应 `P/S/D`；`omega_rad_s` 单位为弧度每秒，视频面板显示度每秒。四角顺序为左上、右上、右下、左下。
+
+完整处理和合成回归测试已通过。完全遮挡期间仍依赖运动预测；本视频在转速变化且完全遮挡一秒时，相对正常处理结果的中心差值最大约 55.7 px，恢复检测后能重新贴合。该比较没有使用人工标注真值。详见 [验证说明](docs/验证说明.md) 和 [算法说明](docs/算法说明.md)。
