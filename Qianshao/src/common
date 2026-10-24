@@ -1,0 +1,65 @@
+#pragma once
+#include <opencv2/opencv.hpp>
+#include <algorithm>
+#include <array>
+#include <vector>
+#include <string>
+#include <cmath>
+
+constexpr double kPi = CV_PI;
+inline double wrapAngle(double x) { return std::remainder(x, 2.0 * kPi); }
+
+struct Bar {
+    cv::Point2f center;
+    cv::Point2f half; // Half of the measured long axis, pointing down in the image.
+    float width = 0, height = 0, area = 0;
+};
+
+struct Orbit {
+    cv::Point2f center, u, v; // Measured light-bar orbit: C + u cos(phi) + v sin(phi).
+    float delta = 0;          // Half of measured angular light-bar separation, radians.
+    cv::Point2f halfHeight;
+    cv::Point2f heightCos{}, heightSin{}; // Measured perspective variation of the bar half axis.
+    float barWidth = 0;
+    int samples = 0;
+    cv::Point2f project(double phase) const {
+        return center + u * static_cast<float>(std::cos(phase)) + v * static_cast<float>(std::sin(phase));
+    }
+    cv::Point2f normalize(cv::Point2f p) const {
+        p -= center;
+        const float det = u.x * v.y - u.y * v.x;
+        return {(p.x * v.y - p.y * v.x) / det, (u.x * p.y - u.y * p.x) / det};
+    }
+    double phaseOf(cv::Point2f p) const { auto q = normalize(p); return std::atan2(q.y, q.x); }
+    double distance(cv::Point2f p) const {
+        const auto q = normalize(p); const double radius = cv::norm(q);
+        if (radius < 1e-5) return std::min(cv::norm(u), cv::norm(v));
+        const double det = u.x*v.y-u.y*v.x;
+        const cv::Point2d gradient((v.y*q.x-u.y*q.y)/det, (-v.x*q.x+u.x*q.y)/det);
+        return std::abs(radius*radius-1.0)/std::max(2.0*cv::norm(gradient),1e-6);
+    }
+};
+
+struct GeometryModel {
+    std::array<Orbit,3> orbits{}; // Stable IDs: upper/middle/lower height levels.
+    bool ready = false;
+};
+
+struct Track {
+    int id = 0;
+    int observed = 0; // 2 = two measured bars, 1 = one measured bar, 0 = prediction.
+    int miss = 0;
+    double phase = 0;
+    double residual = 0;
+    cv::Point2f center;
+    std::array<cv::Point2f,4> box{}; // TL, TR, BR, BL.
+};
+
+struct MotionState {
+    double phase = 0;
+    double omega = 0; // rad/s, estimated only from real measurements.
+    int dir = 0;
+    bool initialized = false;
+    int visible = 0;
+    double residual = 0;
+};
