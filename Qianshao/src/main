@@ -1,0 +1,240 @@
+#define NOMINMAX
+#include <windows.h>
+#include <opencv2/opencv.hpp>
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include "detector.h"
+#include "model.h"
+#include "tracker.h"
+#include "renderer.h"
+
+namespace fs = std::filesystem;
+namespace {
+struct Options {
+    fs::path input = L"前哨站视频.mp4";
+    fs::path output = L"results/stable.mp4";
+    fs::path csv = L"results/tracks.csv";
+    fs::path model = L"results/model.yml";
+    bool gui = true, help = false;
+    int maskStart = -1, maskLength = 0;
+};
+void usage() {
+    std::cout << "Outpost armor tracking (offline, two passes)\n"
+        "  --input FILE       Input video; default: 前哨站视频.mp4\n"
+        "  --output FILE      Output MP4; default: results/stable.mp4\n"
+        "  --csv FILE         Per-frame tracks; default: results/tracks.csv\n"
+        "  --model FILE       Save calibrated model; default: results/model.yml\n"
+        "  --no-gui           Process without a preview window\n"
+        "  --mask-start N     Suppress observations from zero-based frame N\n"
+        "  --mask-length N    Number of consecutive suppressed frames\n"
+        "  --help             Show this help\n"
+        "Relative paths are resolved from the project directory.\n"
+        "During playback, press Esc or q to finish early.\n";
+}
+int integerArgument(const std::wstring& text) {
+    std::size_t count = 0;
+    const int value = std::stoi(text, &count);
+    if (count != text.size() || value < 0) throw std::runtime_error("Expected a nonnegative integer.");
+    return value;
+}
+Options parseOptions(int argc, wchar_t** argv) {
+    Options o;
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring flag(argv[i]);
+        if (flag == L"--help" || flag == L"-h") { o.help = true; continue; }
+        if (flag == L"--no-gui") { o.gui = false; continue; }
+        if (i + 1 >= argc) throw std::runtime_error("Missing value after " + fs::path(flag).u8string());
+        const std::wstring value(argv[++i]);
+        if (value.empty()) throw std::runtime_error("An empty argument is not allowed.");
+        if (flag == L"--input") o.input = value;
+        else if (flag == L"--output") o.output = value;
+        else if (flag == L"--csv") o.csv = value;
+        else if (flag == L"--model") o.model = value;
+        else if (flag == L"--mask-start") o.maskStart = integerArgument(value);
+        else if (flag == L"--mask-length") o.maskLength = integerArgument(value);
+        else throw std::runtime_error("Unknown option: " + fs::path(flag).u8string());
+    }
+    if (o.maskLength > 0 && o.maskStart < 0) throw std::runtime_error("--mask-length requires --mask-start.");
+    return o;
+}
+fs::path projectDirectory() {
+    std::wstring executable(32768, L'\0');
+    const DWORD count = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (count == 0 || count >= executable.size()) throw std::runtime_error("Cannot resolve executable path.");
+    executable.resize(count);
+    for (auto directory = fs::path(executable).parent_path(); !directory.empty();) {
+        if (fs::is_regular_file(directory / L"src" / L"main.cpp")) return directory;
+        const auto parent = directory.parent_path();
+        if (parent == directory) break;
+        directory = parent;
+    }
+    if (fs::is_regular_file(fs::current_path() / L"src" / L"main.cpp")) return fs::current_path();
+    throw std::runtime_error("Cannot find project directory (expected src/main.cpp).");
+}
+fs::path resolved(const fs::path& base, const fs::path& path) {
+    return fs::weakly_canonical(path.is_absolute() ? path : base / path);
+}
+bool samePath(const fs::path& a, const fs::path& b) {
+    std::error_code error;
+    if (fs::exists(a) && fs::exists(b) && fs::equivalent(a, b, error)) return true;
+    return _wcsicmp(a.c_str(), b.c_str()) == 0;
+}
+struct RuntimeFiles {
+    fs::path directory, originalDirectory;
+    explicit RuntimeFiles(const fs::path& project) : originalDirectory(fs::current_path()) {
+        directory = project / L".runtime" / (L"run-" + std::to_wstring(GetCurrentProcessId()));
+        fs::create_directories(directory);
+    }
+    ~RuntimeFiles() {
+        SetCurrentDirectoryW(originalDirectory.c_str());
+        std::error_code ignored;
+        fs::remove(directory / L"input.mp4", ignored);
+        fs::remove(directory / L"output.mp4", ignored);
+        fs::remove(directory, ignored);
+        fs::remove(directory.parent_path(), ignored);
+    }
+    void prepare(const fs::path& input) {
+        std::error_code error;
+        fs::create_hard_link(input, directory / L"input.mp4", error);
+        if (error) fs::copy_file(input, directory / L"input.mp4", fs::copy_options::overwrite_existing);
+        if (!SetCurrentDirectoryW(directory.c_str())) throw std::runtime_error("Cannot enter runtime directory.");
+    }
+};
+void saveModel(const fs::path& path, const GeometryModel& geometry, cv::Size size, double fps, int frames) {
+    cv::FileStorage storage("", cv::FileStorage::WRITE | cv::FileStorage::MEMORY | cv::FileStorage::FORMAT_YAML);
+    storage << "format_version" << 1 << "width" << size.width << "height" << size.height
+        << "fps" << fps << "frames_decoded" << frames << "ready" << static_cast<int>(geometry.ready);
+    storage << "orbits" << "[";
+    for (const auto& o : geometry.orbits)
+        storage << "{" << "center" << o.center << "u" << o.u << "v" << o.v
+            << "delta" << o.delta << "half_height" << o.halfHeight
+            << "height_cos" << o.heightCos << "height_sin" << o.heightSin
+            << "bar_width" << o.barWidth << "samples" << o.samples << "}";
+    storage << "]";
+    std::ofstream output(path, std::ios::binary);
+    if (!output) throw std::runtime_error("Cannot create model file: " + path.u8string());
+    output << storage.releaseAndGetString();
+    output.close();
+    if (!output) throw std::runtime_error("Failed writing model file.");
+}
+void publishVideo(const fs::path& staging, const fs::path& destination) {
+    if (!MoveFileExW(staging.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+        throw std::runtime_error("Cannot save output video (Windows error " + std::to_string(GetLastError()) + "): " + destination.u8string());
+}
+} // namespace
+
+int wmain(int argc, wchar_t** argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    try {
+        auto options = parseOptions(argc, argv);
+        if (options.help) { usage(); return 0; }
+        const auto project = projectDirectory();
+        options.input = resolved(project, options.input);
+        options.output = resolved(project, options.output);
+        options.csv = resolved(project, options.csv);
+        options.model = resolved(project, options.model);
+        if (!fs::is_regular_file(options.input)) throw std::runtime_error("Input video does not exist: " + options.input.u8string());
+        const std::array<fs::path, 4> paths{options.input, options.output, options.csv, options.model};
+        for (std::size_t i = 0; i < paths.size(); ++i)
+            for (std::size_t j = i + 1; j < paths.size(); ++j)
+                if (samePath(paths[i], paths[j])) throw std::runtime_error("Input, output, CSV, and model paths must differ.");
+        for (const auto& path : {options.output, options.csv, options.model}) fs::create_directories(path.parent_path());
+        RuntimeFiles runtime(project);
+        runtime.prepare(options.input);
+        cv::VideoCapture capture("input.mp4", cv::CAP_FFMPEG);
+        if (!capture.isOpened()) throw std::runtime_error("Cannot open input video. Check the OpenCV FFmpeg DLL.");
+        double fps = capture.get(cv::CAP_PROP_FPS);
+        if (!std::isfinite(fps) || fps < 1.0 || fps > 500.0) {
+            fps = 30.0;
+            std::cerr << "[warning] Invalid FPS metadata; using 30 fps.\n";
+        }
+        std::cout << "[1/2] Decoding all frames and calibrating geometry...\n";
+        Detector detector;
+        std::vector<std::vector<Bar>> history;
+        cv::Size size;
+        cv::Mat frame;
+        while (capture.read(frame)) {
+            if (frame.empty()) throw std::runtime_error("Decoder returned an empty frame.");
+            if (history.empty()) size = frame.size();
+            if (frame.size() != size) throw std::runtime_error("Video resolution changed during decoding.");
+            history.push_back(detector.detect(frame));
+            if (history.size() % 300 == 0) std::cout << "  decoded " << history.size() << " frames\n";
+        }
+        capture.release();
+        if (history.empty()) throw std::runtime_error("No video frames could be decoded.");
+        if (history.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) throw std::runtime_error("Video is too long.");
+        std::string calibrationError;
+        const GeometryModel geometry = calibrateGeometry(history, size, calibrationError);
+        if (!geometry.ready) throw std::runtime_error("Geometry calibration failed: " + calibrationError);
+        saveModel(options.model, geometry, size, fps, static_cast<int>(history.size()));
+        std::cout << "  calibrated " << history.size() << " decoded frames, " << size.width << "x" << size.height << ", " << fps << " fps\n";
+        capture.open("input.mp4", cv::CAP_FFMPEG);
+        if (!capture.isOpened()) throw std::runtime_error("Cannot reopen input video for tracking.");
+        cv::VideoWriter writer("output.mp4", cv::CAP_FFMPEG, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, size);
+        if (!writer.isOpened()) throw std::runtime_error("Cannot create MP4 output video.");
+        std::ofstream csv(options.csv, std::ios::binary);
+        if (!csv) throw std::runtime_error("Cannot create CSV: " + options.csv.u8string());
+        csv << "frame,time_s,id,observed,miss,phase_rad,cx,cy,tl_x,tl_y,tr_x,tr_y,br_x,br_y,bl_x,bl_y,omega_rad_s,residual_px\n";
+        csv << std::fixed << std::setprecision(6);
+        Tracker tracker(geometry, fps);
+        std::cout << "[2/2] Tracking and writing video...\n";
+        if (options.maskLength > 0) std::cout << "  validation mask: frames " << options.maskStart << " to " << (static_cast<long long>(options.maskStart) + options.maskLength - 1) << "\n";
+        int frameIndex = 0;
+        bool stoppedEarly = false;
+        while (capture.read(frame)) {
+            const auto started = std::chrono::steady_clock::now();
+            if (frameIndex >= static_cast<int>(history.size())) throw std::runtime_error("Second decode produced more frames than calibration pass.");
+            auto bars = history[frameIndex];
+            if (options.maskStart >= 0 && frameIndex >= options.maskStart && static_cast<long long>(frameIndex) < static_cast<long long>(options.maskStart) + options.maskLength) bars.clear();
+            tracker.update(bars, frameIndex);
+            const auto& tracks = tracker.tracks();
+            const auto& state = tracker.state();
+            cv::Mat canvas = Renderer::draw(frame, tracks, state, geometry, frameIndex, fps);
+            if (canvas.empty() || canvas.size() != size) throw std::runtime_error("Renderer returned an invalid frame.");
+            writer.write(canvas);
+            for (const auto& track : tracks) {
+                csv << frameIndex << ',' << frameIndex / fps << ',' << track.id << ',' << track.observed << ',' << track.miss
+                    << ',' << track.phase << ',' << track.center.x << ',' << track.center.y;
+                for (const auto& corner : track.box) csv << ',' << corner.x << ',' << corner.y;
+                csv << ',' << state.omega << ',' << track.residual << '\n';
+            }
+            if (!csv) throw std::runtime_error("Failed writing track CSV.");
+            ++frameIndex;
+            if (frameIndex % 150 == 0) std::cout << "  " << frameIndex << '/' << history.size() << " frames, omega=" << std::fixed << std::setprecision(2) << state.omega << " rad/s\n";
+            if (options.gui) {
+                cv::imshow("Outpost - stable armor tracking (Esc/q to finish)", canvas);
+                const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                const int key = cv::waitKey(std::max(1, static_cast<int>(std::lround(1000.0 / fps - elapsed))));
+                if (key == 27 || key == 'q' || key == 'Q') { stoppedEarly = true; break; }
+            }
+        }
+        capture.release();
+        writer.release();
+        csv.close();
+        if (!csv) throw std::runtime_error("Failed closing track CSV.");
+        if (options.gui) cv::destroyAllWindows();
+        if (!stoppedEarly && frameIndex != static_cast<int>(history.size())) throw std::runtime_error("Second decode ended before the calibration frame count.");
+        const auto stagedVideo = runtime.directory / L"output.mp4";
+        if (frameIndex == 0 || !fs::exists(stagedVideo) || fs::file_size(stagedVideo) == 0) throw std::runtime_error("No video output was written.");
+        publishVideo(stagedVideo, options.output);
+        std::cout << "[done] " << frameIndex << " frames" << (stoppedEarly ? " (stopped by user)" : "") << "\n"
+            << "  video: " << options.output.u8string() << "\n"
+            << "  CSV:   " << options.csv.u8string() << "\n"
+            << "  model: " << options.model.u8string() << std::endl;
+        return 0;
+    } catch (const cv::Exception& error) {
+        std::cerr << "[OpenCV error] " << error.what() << std::endl;
+    } catch (const std::exception& error) {
+        std::cerr << "[error] " << error.what() << std::endl;
+    }
+    return 1;
+}
