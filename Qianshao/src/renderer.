@@ -1,0 +1,8 @@
+#pragma once
+#include "common.h"
+class Renderer {
+public:
+    static cv::Mat draw(const cv::Mat& frame, const std::vector<Track>& tracks,
+                        const MotionState& state, const GeometryModel& geometry,
+                        int frameIndex, double fps);
+};
